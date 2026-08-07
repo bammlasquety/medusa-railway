@@ -28,5 +28,21 @@ module.exports = defineConfig({
   },
   modules: [
     { key: "api_key", resolve: "@medusajs/medusa/api-key" },
+    {
+      resolve: "@medusajs/medusa/payment",
+      options: {
+        providers: [
+          {
+            resolve: "./src/modules/paymongo",
+            id: "paymongo",
+            options: {
+              secretKey: process.env.PAYMONGO_SECRET_KEY,
+              webhookSecret: process.env.PAYMONGO_WEBHOOK_SECRET,
+              storefrontUrl: process.env.STOREFRONT_URL,
+            },
+          },
+        ],
+      },
+    },
   ],
 })
