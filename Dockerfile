@@ -11,7 +11,7 @@ COPY medusa-config.ts ./
 COPY src ./src
 
 RUN npm config set registry https://registry.npmmirror.com/ && \
-    npm install --legacy-peer-deps --no-audit --no-fund
+    npm install --no-package-lock --legacy-peer-deps --no-audit --no-fund
 
 RUN npx medusa build
 
