@@ -10,7 +10,8 @@ COPY tsconfig.json ./
 COPY medusa-config.ts ./
 COPY src ./src
 
-RUN npm install --legacy-peer-deps --no-audit --no-fund
+RUN npm config set registry https://registry.yarnpkg.com/ && \
+    npm install --legacy-peer-deps --no-audit --no-fund
 
 RUN npx medusa build
 
