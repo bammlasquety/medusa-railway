@@ -68,11 +68,17 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
 
   protected readonly logger_: Logger
   protected readonly client_: PaymongoClient
+  
+  // 1. Declare the property and its type
+  protected options_: PaymongoOptions 
 
   constructor(container: InjectedDependencies, options: PaymongoOptions) {
     super(container, options)
     this.logger_ = container.logger
     this.client_ = new PaymongoClient(options.secretKey, container.logger)
+    
+    // 2. Assign the passed options to the class property
+    this.options_ = options 
   }
 
   static validateOptions(options: Record<any, any>) {
