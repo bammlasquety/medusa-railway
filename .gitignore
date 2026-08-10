@@ -5,6 +5,8 @@ dist/
 .next/
 .env
 .env.*
+*.example
+.env.local
 !.env.example
 *.log
 npm-debug.log*
