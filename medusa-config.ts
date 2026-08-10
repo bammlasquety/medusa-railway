@@ -44,5 +44,47 @@ module.exports = defineConfig({
         ],
       },
     },
+    {
+      resolve: '@medusajs/medusa/file',
+      options: {
+        providers: [
+          {
+            resolve: '@medusajs/medusa/file-local',
+            id: 'local',
+            options: {
+              upload_dir: 'static',
+              // Must be an absolute, publicly reachable origin — not localhost.
+              backend_url: `${process.env.MEDUSA_BACKEND_URL}/static`,
+            },
+          },
+        ],
+      },
+    },
+    {
+      resolve: "@medusajs/medusa/file",
+      options: {
+        providers: [
+          {
+            resolve: "@medusajs/medusa/file-s3",
+            id: "s3",
+            options: {
+              // Public read URL for the bucket — this is what gets persisted onto
+              // product.thumbnail, so it must be the browser-facing origin.
+              file_url: process.env.S3_FILE_URL,
+              access_key_id: process.env.S3_ACCESS_KEY_ID,
+              secret_access_key: process.env.S3_SECRET_ACCESS_KEY,
+              region: process.env.S3_REGION,
+              bucket: process.env.S3_BUCKET,
+              endpoint: process.env.S3_ENDPOINT,
+              additional_client_config: {
+                // REQUIRED for Supabase. Without it the SDK builds virtual-hosted
+                // URLs (bucket.host/...) and every upload fails to resolve.
+                forcePathStyle: true,
+              },
+            },
+          },
+        ],
+      },
+    },
   ],
 })
