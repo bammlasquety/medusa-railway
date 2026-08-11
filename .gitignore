@@ -17,3 +17,14 @@ Thumbs.db
 .idea/
 .vscode/
 coverage/
+
+# SSH keys — never commit. `railway connect` needs a keypair, and generating it
+# inside the repo root puts an unencrypted private key one `git add -A` away
+# from a public repository.
+dendrotonics-ssh
+dendrotonics-ssh.pub
+*.pem
+id_ed25519
+id_ed25519.pub
+id_rsa
+id_rsa.pub

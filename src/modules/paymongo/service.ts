@@ -51,9 +51,23 @@ import { PaymongoClient, verifyPaymongoSignature } from './client'
 export interface PaymongoOptions {
   secretKey: string
   webhookSecret: string
-  /** Absolute origin PayMongo returns the buyer to. Must match the origin they
-   *  are browsing, or the storefront's claim cookie will not come back. */
+  /** Default origin PayMongo returns the buyer to, when the caller does not
+   *  request one. Must be an origin a buyer actually browses. */
   storefrontUrl: string
+  /**
+   * Origins a caller may ask to be returned to, beyond `storefrontUrl`.
+   *
+   * One Medusa commonly serves more than one storefront — a developer on
+   * localhost and the deployed site — and a single global return URL means
+   * whichever one is not configured sends its buyers to the other. They arrive
+   * at a deployment that does not have their cart cookie, and every diagnostic
+   * log is written on the wrong machine.
+   *
+   * This is an ALLOWLIST, not a free-form field. `/store` routes are reachable
+   * by anyone holding the publishable key, so an unchecked `return_origin`
+   * would let a stranger point your payment confirmations at their own site.
+   */
+  allowedReturnOrigins?: string[]
   paymentMethodTypes?: string[]
   /** Hosted Checkout only bills in PHP. */
   currency?: string
@@ -68,17 +82,21 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
 
   protected readonly logger_: Logger
   protected readonly client_: PaymongoClient
-  
-  // 1. Declare the property and its type
-  protected options_: PaymongoOptions 
+
+  /**
+   * `AbstractPaymentProvider` does NOT expose the options it was constructed
+   * with — the base class takes them but keeps them private. Every provider
+   * declares and assigns its own `options_`; Medusa's own docs example does the
+   * same. Omitting this compiles fine in isolation and fails the moment the real
+   * base class is resolved.
+   */
+  protected readonly options_: PaymongoOptions
 
   constructor(container: InjectedDependencies, options: PaymongoOptions) {
     super(container, options)
     this.logger_ = container.logger
+    this.options_ = options
     this.client_ = new PaymongoClient(options.secretKey, container.logger)
-    
-    // 2. Assign the passed options to the class property
-    this.options_ = options 
   }
 
   static validateOptions(options: Record<any, any>) {
@@ -90,6 +108,56 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
         )
       }
     }
+  }
+
+  /**
+   * Decides where PayMongo sends the buyer back to.
+   *
+   * The caller may ask for its own origin, which is what lets one Medusa serve a
+   * developer on localhost and the deployed storefront at the same time. The
+   * request is honoured only if the origin is on the allowlist — `/store` routes
+   * are public to anyone with the publishable key, so an unchecked value here
+   * would be an open redirect for payment confirmations.
+   *
+   * A rejected request is logged and falls back to the configured default rather
+   * than throwing: the buyer still completes, just on the canonical origin.
+   */
+  private resolveReturnOrigin(requested?: unknown): string {
+    const fallback = this.options_.storefrontUrl.replace(/\/$/, '')
+    const asked = String(requested ?? '').replace(/\/$/, '')
+    if (!asked) return fallback
+
+    const allowed = [fallback, ...(this.options_.allowedReturnOrigins ?? [])].map((entry) =>
+      String(entry).replace(/\/$/, '').toLowerCase()
+    )
+
+    // Compare parsed origins, not strings — "http://localhost:3000/" and
+    // "http://LOCALHOST:3000" are the same place and a string compare says no.
+    let askedOrigin: string
+    try {
+      askedOrigin = new URL(asked).origin.toLowerCase()
+    } catch {
+      this.logger_.warn(`[paymongo] ignoring unparseable return_origin: ${asked}`)
+      return fallback
+    }
+
+    const match = allowed.find((entry) => {
+      try {
+        return new URL(entry).origin.toLowerCase() === askedOrigin
+      } catch {
+        return false
+      }
+    })
+
+    if (!match) {
+      this.logger_.warn(
+        `[paymongo] return_origin ${askedOrigin} is not allowlisted; using ${fallback}. ` +
+          'Add it to allowedReturnOrigins if this is one of your storefronts.'
+      )
+      return fallback
+    }
+
+    return asked
   }
 
   /**
@@ -160,7 +228,7 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
     }
 
     const reference = `DND-${randomUUID().slice(0, 8).toUpperCase()}`
-    const origin = options.storefrontUrl.replace(/\/$/, '')
+    const origin = this.resolveReturnOrigin((input.data as any)?.return_origin)
     const context: any = input.context ?? {}
 
     try {
