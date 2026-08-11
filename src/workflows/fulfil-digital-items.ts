@@ -6,7 +6,6 @@ import {
   createStep,
   createWorkflow,
   transform,
-  when,
 } from '@medusajs/framework/workflows-sdk'
 
 import { DIGITAL_DELIVERY_MODULE } from '../modules/digital-delivery'
@@ -46,6 +45,9 @@ const resolveDigitalItemsStep = createStep(
         'items.product_id',
         'items.product_title',
         'items.variant_title',
+        // Needed to decide whether Medusa can create a fulfillment at all: with
+        // no shipping method there is no service zone to fulfil against.
+        'shipping_methods.id',
       ],
       filters: { id: input.orderId },
     })
@@ -127,6 +129,67 @@ const emitGrantedStep = createStep(
   }
 )
 
+/**
+ * Records a Medusa fulfillment for the digital lines — BEST EFFORT.
+ *
+ * This step swallows its own failures on purpose, and that is the most important
+ * decision in this file.
+ *
+ * `createOrderFulfillmentWorkflow` derives the fulfilling location by walking
+ * shipping method → shipping option → service zone → fulfillment set. A digital
+ * order legitimately has no shipping method, so that walk hits `undefined` and
+ * throws `Cannot read properties of undefined (reading 'service_zone')`.
+ *
+ * Run as a normal step, that failure rolled back the workflow — which DELETED
+ * the grants the buyer had just paid for. The essential thing (the grant) was
+ * made to depend on the cosmetic one (an admin-facing fulfillment record). That
+ * is backwards: a buyer must get their file whether or not Medusa's fulfillment
+ * bookkeeping succeeds.
+ *
+ * So the failure is logged and the workflow continues. The cost is an order that
+ * reads as unfulfilled in admin, which is visible and fixable by hand. The
+ * alternative cost was a paid order with no download, which is neither.
+ */
+const recordFulfillmentStep = createStep(
+  'record-digital-fulfillment',
+  async (
+    input: { orderId: string; lineItemIds: string[]; hasShipping: boolean },
+    { container }
+  ) => {
+    if (!input.lineItemIds.length) return new StepResponse(void 0)
+
+    const logger = container.resolve('logger')
+
+    if (!input.hasShipping) {
+      logger.info(
+        `[digital] order ${input.orderId} has no shipping method, so there is no service zone ` +
+          'to fulfil against. Grants are issued; no Medusa fulfillment record created.'
+      )
+      return new StepResponse(void 0)
+    }
+
+    try {
+      await createOrderFulfillmentWorkflow(container).run({
+        input: {
+          order_id: input.orderId,
+          items: input.lineItemIds.map((id) => ({ id, quantity: 1 })),
+          // The buyer is told by the digital_delivery.granted email, which
+          // carries the actual links. Medusa's generic shipment notice would be
+          // a second, emptier email about the same event.
+          no_notification: true,
+        } as any,
+      })
+    } catch (error) {
+      logger.warn(
+        `[digital] could not record a Medusa fulfillment for ${input.orderId}: ` +
+          `${(error as Error)?.message ?? error}. Downloads are unaffected.`
+      )
+    }
+
+    return new StepResponse(void 0)
+  }
+)
+
 // ---------------------------------------------------------------------------
 
 export const fulfilDigitalItemsWorkflow = createWorkflow(
@@ -140,33 +203,18 @@ export const fulfilDigitalItemsWorkflow = createWorkflow(
     })
 
     /**
-     * Only touch Medusa's fulfillment machinery when there is something digital
-     * to fulfil. A physical-only order must fall straight through — creating an
-     * empty fulfillment would mark a seedling order as shipped.
+     * Emitted BEFORE the fulfillment record, so the buyer's email does not
+     * depend on Medusa's bookkeeping either.
      */
-    const hasDigital = transform({ resolved }, (data) => (data.resolved.assets?.length ?? 0) > 0)
-
-    when({ hasDigital }, (data) => data.hasDigital).then(() => {
-      const items = transform({ resolved }, (data) =>
-        data.resolved.assets.map((asset: DigitalAsset) => ({
-          id: asset.lineItemId,
-          quantity: 1,
-        }))
-      )
-
-      createOrderFulfillmentWorkflow.runAsStep({
-        input: transform({ input, items }, (data) => ({
-          order_id: data.input.orderId,
-          items: data.items,
-          // The buyer is told by the digital_delivery.granted email, which
-          // carries the actual links. Medusa's generic shipment notice would be
-          // a second, emptier email about the same event.
-          no_notification: true,
-        })),
-      })
-    })
-
     emitGrantedStep({ orderId: input.orderId, grantIds: granted.grantIds })
+
+    recordFulfillmentStep(
+      transform({ input, resolved }, (data) => ({
+        orderId: data.input.orderId,
+        lineItemIds: (data.resolved.assets ?? []).map((asset: DigitalAsset) => asset.lineItemId),
+        hasShipping: Boolean((data.resolved.order as any)?.shipping_methods?.length),
+      }))
+    )
 
     return new WorkflowResponse({ grantIds: granted.grantIds })
   }
