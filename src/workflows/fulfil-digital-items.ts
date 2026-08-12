@@ -159,11 +159,39 @@ const recordFulfillmentStep = createStep(
     if (!input.lineItemIds.length) return new StepResponse(void 0)
 
     const logger = container.resolve('logger')
+    const query = container.resolve('query')
 
-    if (!input.hasShipping) {
+    /**
+     * Supply the location EXPLICITLY rather than letting Medusa derive it.
+     *
+     * Normally it walks shipping method → shipping option → service zone →
+     * fulfillment set → location. A digital order has no shipping method, so
+     * that walk hits `undefined` and throws on `service_zone`.
+     *
+     * Medusa Admin's own fulfil form offers Location as a field and treats
+     * Shipping method as optional, so a `location_id` is a first-class input.
+     * That is the honest fix: an ebook genuinely has no shipping method, and
+     * inventing a ₱0 shipping option purely to satisfy a lookup would put a
+     * fake delivery line on every digital order.
+     */
+    let locationId = ''
+
+    try {
+      const { data: locations } = await query.graph({
+        entity: 'stock_location',
+        fields: ['id', 'name'],
+        pagination: { take: 1 },
+      })
+      locationId = String(locations?.[0]?.id ?? '')
+    } catch (error) {
+      logger.warn(`[digital] could not list stock locations: ${(error as Error)?.message ?? error}`)
+    }
+
+    if (!locationId && !input.hasShipping) {
       logger.info(
-        `[digital] order ${input.orderId} has no shipping method, so there is no service zone ` +
-          'to fulfil against. Grants are issued; no Medusa fulfillment record created.'
+        `[digital] order ${input.orderId}: no stock location and no shipping method, so Medusa ` +
+          'has nothing to fulfil against. Grants are issued; the order stays unfulfilled in ' +
+          'admin. Create a stock location to have digital orders show as fulfilled.'
       )
       return new StepResponse(void 0)
     }
@@ -173,12 +201,15 @@ const recordFulfillmentStep = createStep(
         input: {
           order_id: input.orderId,
           items: input.lineItemIds.map((id) => ({ id, quantity: 1 })),
+          ...(locationId ? { location_id: locationId } : {}),
           // The buyer is told by the digital_delivery.granted email, which
           // carries the actual links. Medusa's generic shipment notice would be
           // a second, emptier email about the same event.
           no_notification: true,
         } as any,
       })
+
+      logger.info(`[digital] recorded fulfillment for ${input.orderId} at location ${locationId}`)
     } catch (error) {
       logger.warn(
         `[digital] could not record a Medusa fulfillment for ${input.orderId}: ` +
