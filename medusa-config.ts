@@ -1,6 +1,75 @@
+import { randomBytes } from "node:crypto"
+
 import { loadEnv, defineConfig } from "@medusajs/framework/utils"
 
 loadEnv(process.env.NODE_ENV || "production", process.cwd())
+
+/**
+ * Reads a signing secret, and refuses to invent one.
+ *
+ * `jwtSecret` and `cookieSecret` used to fall back to the string `"supersecret"`
+ * — the placeholder shipped in the Medusa starter and in every fork of it,
+ * including the template this deployment came from. It is public knowledge.
+ *
+ * With it in force, anyone can mint a customer JWT for any `actor_id` and:
+ *
+ *   - read any customer's order history, email and totals, and
+ *   - pass the `ownsOrder` check on `/store/digital-downloads`, which mints
+ *     working download links for every digital product ever sold here.
+ *
+ * The value on Railway is correct today. That is not what this guard is for. It
+ * is for the next environment — a staging service, a second region, a fresh
+ * deploy where someone forgets one variable — because the failure is SILENT. The
+ * backend boots, logs nothing, serves traffic, and signs its tokens with a key
+ * an attacker already has. There is no symptom to notice.
+ *
+ * So: throw. A backend that will not start is a five-minute outage with an error
+ * message naming the variable. A backend that starts with a known signing key is
+ * a breach you find out about from someone else.
+ *
+ * Development gets a random secret per boot rather than a constant. That keeps
+ * `medusa develop` and `medusa db:generate` working on a machine with no
+ * production secrets — the reason module registration is already conditional
+ * below — while ensuring the dev key is never a value anyone can guess. Sessions
+ * do not survive a restart locally, which is the correct trade.
+ */
+const PLACEHOLDER_SECRETS = new Set([
+  "supersecret",
+  "secret",
+  "changeme",
+  "change-me",
+  "your-secret",
+])
+
+/** Matches `loadEnv` above, which already treats an unset NODE_ENV as
+ *  production. Anything that is not explicitly development or test is held to
+ *  production rules — the safe direction to be wrong in. */
+const isDevLike = ["development", "test"].includes(process.env.NODE_ENV ?? "")
+
+function requiredSecret(name: string): string {
+  const value = (process.env[name] ?? "").trim()
+  const usable = value.length >= 16 && !PLACEHOLDER_SECRETS.has(value.toLowerCase())
+
+  if (usable) return value
+
+  if (!isDevLike) {
+    throw new Error(
+      `[security] ${name} is ${value ? "a placeholder or too short" : "not set"}. ` +
+        `It signs customer sessions, so a knowable value lets anyone forge a session ` +
+        `for any customer and download every digital product in the store. ` +
+        `Set it to at least 32 random bytes: \`openssl rand -hex 32\`. ` +
+        `Refusing to start.`
+    )
+  }
+
+  console.warn(
+    `[security] ${name} is not set — using a random value for this process only. ` +
+      `Sessions will not survive a restart. This is allowed in development and ` +
+      `would abort the boot in any other environment.`
+  )
+
+  return randomBytes(32).toString("hex")
+}
 
 /**
  * Modules whose registration depends on whether their credentials exist.
@@ -26,8 +95,8 @@ module.exports = defineConfig({
       storeCors: process.env.STORE_CORS || "",
       adminCors: process.env.ADMIN_CORS || "",
       authCors: process.env.AUTH_CORS || "",
-      jwtSecret: process.env.JWT_SECRET || "supersecret",
-      cookieSecret: process.env.COOKIE_SECRET || "supersecret",
+      jwtSecret: requiredSecret("JWT_SECRET"),
+      cookieSecret: requiredSecret("COOKIE_SECRET"),
     },
   },
   admin: {
