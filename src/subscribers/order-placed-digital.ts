@@ -1,6 +1,7 @@
 import type { SubscriberArgs, SubscriberConfig } from '@medusajs/medusa'
 
 import { fulfilDigitalItemsWorkflow } from '../workflows/fulfil-digital-items'
+import { logCommerceIssue } from '../lib/commerce-issues'
 
 /**
  * The trigger.
@@ -38,6 +39,13 @@ export default async function orderPlacedDigitalHandler({
     logger.error(
       `[digital] fulfilment failed for order ${data.id}: ${(error as Error)?.message ?? error}`
     )
+    await logCommerceIssue(logger, {
+      stage: 'fulfilment',
+      code: 'fulfilment.digital_failed',
+      severity: 'critical',
+      message: `Digital fulfilment failed: ${(error as Error)?.message ?? error}`,
+      orderId: data.id,
+    })
   }
 }
 

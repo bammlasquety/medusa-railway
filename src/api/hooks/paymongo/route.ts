@@ -8,6 +8,7 @@ import {
   PAYMONGO_LEDGER_MODULE,
 } from '../../../modules/paymongo-ledger'
 import type PaymongoLedgerService from '../../../modules/paymongo-ledger/service'
+import { logCommerceIssue } from '../../../lib/commerce-issues'
 
 /**
  * PayMongo's webhook endpoint.
@@ -88,6 +89,13 @@ export const POST = async (req: MedusaRequest, res: MedusaResponse): Promise<voi
     // Refusing beats accepting. An unset secret with a permissive handler is an
     // open endpoint that creates orders.
     logger.error('[paymongo] no webhook secret configured; rejecting delivery')
+    await logCommerceIssue(logger, {
+      stage: 'webhook',
+      code: 'webhook.secret_missing',
+      severity: 'critical',
+      message: 'PAYMONGO_WEBHOOK_SECRET is not set; every PayMongo webhook is being rejected.',
+      fingerprint: 'webhook|webhook.secret_missing',
+    })
     res.status(500).json({ received: false })
     return
   }
@@ -108,6 +116,13 @@ export const POST = async (req: MedusaRequest, res: MedusaResponse): Promise<voi
      * quiet about.
      */
     logger.error('[paymongo] webhook signature rejected')
+    await logCommerceIssue(logger, {
+      stage: 'webhook',
+      code: 'webhook.signature_rejected',
+      severity: 'warning',
+      message: 'A PayMongo webhook failed signature verification. Check PAYMONGO_WEBHOOK_SECRET matches this endpoint.',
+      fingerprint: 'webhook|webhook.signature_rejected',
+    })
     res.status(401).json({ received: false })
     return
   }

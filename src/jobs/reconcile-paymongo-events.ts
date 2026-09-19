@@ -3,6 +3,7 @@ import { Modules } from '@medusajs/framework/utils'
 
 import { PAYMONGO_EVENT_RECEIVED, PAYMONGO_LEDGER_MODULE } from '../modules/paymongo-ledger'
 import type PaymongoLedgerService from '../modules/paymongo-ledger/service'
+import { logCommerceIssue } from '../lib/commerce-issues'
 
 /**
  * The promise-keeper.
@@ -75,6 +76,15 @@ export default async function reconcilePaymongoEvents(container: MedusaContainer
   )
 
   if (abandoned.length) {
+    await logCommerceIssue(logger, {
+      stage: 'webhook',
+      code: 'webhook.retries_exhausted',
+      severity: 'critical',
+      message:
+        'PayMongo webhook events are past the retry limit and are no longer re-driven. ' +
+        `Check paymongo_events where status <> 'processed' and attempts >= ${MAX_ATTEMPTS}.`,
+      fingerprint: 'webhook|webhook.retries_exhausted',
+    })
     logger.error(
       '[paymongo] there are webhook events past the retry limit that no longer get re-driven. ' +
         "select * from paymongo_events where status <> 'processed' and attempts >= " +

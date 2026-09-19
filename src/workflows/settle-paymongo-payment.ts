@@ -11,6 +11,7 @@ import {
 import { parsePaymongoEvent } from '../modules/paymongo/event-payload'
 import { PAYMONGO_LEDGER_MODULE } from '../modules/paymongo-ledger'
 import type PaymongoLedgerService from '../modules/paymongo-ledger/service'
+import { logCommerceIssue, resolveCommerceIssuesForCart } from '../lib/commerce-issues'
 
 /**
  * Turns a claimed PayMongo event into an order.
@@ -229,6 +230,9 @@ const settleClaimStep = createStep(
       state: string
       reason: string
       paymongoPaymentId: string
+      cartId: string
+      reference: string
+      checkoutSessionId: string
     },
     { container }
   ) => {
@@ -242,6 +246,7 @@ const settleClaimStep = createStep(
         orderId: input.orderId || null,
         paymongoPaymentId: input.paymongoPaymentId || null,
       })
+      if (input.orderId) await resolveCommerceIssuesForCart(logger, input.cartId, input.orderId)
       return new StepResponse(void 0)
     }
 
@@ -252,6 +257,29 @@ const settleClaimStep = createStep(
     )
 
     await ledger.markFailed(input.ledgerId, `${input.state}: ${input.reason}`, !terminal)
+
+    /**
+     * PayMongo said PAID and there is still no order. `pending` is usually a
+     * payment PayMongo has not finalised (QR Ph) and is retried; `error` is a
+     * cart Medusa refuses to complete (e.g. no shipping method can carry an
+     * item) and will not fix itself — money has moved, so it is critical.
+     */
+    await logCommerceIssue(logger, {
+      stage: input.state === 'pending' ? 'payment_confirmation' : 'order',
+      code:
+        input.state === 'pending'
+          ? 'payment_confirmation.webhook_pending'
+          : terminal
+            ? 'webhook.unrecoverable'
+            : 'order.completion_failed',
+      severity: input.state === 'pending' ? 'warning' : 'critical',
+      message: `Paid webhook did not produce an order (${input.state}): ${input.reason}`,
+      reference: input.reference,
+      cartId: input.cartId,
+      paymongoSessionId: input.checkoutSessionId,
+      paymongoPaymentId: input.paymongoPaymentId,
+      context: { ledger_id: input.ledgerId },
+    })
 
     return new StepResponse(void 0)
   }
@@ -290,6 +318,9 @@ export const settlePaymongoPaymentWorkflow = createWorkflow(
         state: String((data.completion as any)?.state ?? 'skipped'),
         reason: String((data.completion as any)?.reason ?? ''),
         paymongoPaymentId: String((data.claim as any)?.event?.paymongoPaymentId ?? ''),
+        cartId: String((data.claim as any)?.event?.cartId ?? ''),
+        reference: String((data.claim as any)?.event?.reference ?? ''),
+        checkoutSessionId: String((data.claim as any)?.event?.checkoutSessionId ?? ''),
       }))
     )
 

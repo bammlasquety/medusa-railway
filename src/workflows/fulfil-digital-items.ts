@@ -12,6 +12,7 @@ import { DIGITAL_DELIVERY_MODULE } from '../modules/digital-delivery'
 import { MetadataAssetCatalogue } from '../modules/digital-delivery/adapters/metadata-asset-catalogue'
 import { DIGITAL_DELIVERY_GRANTED } from '../modules/digital-delivery/ports'
 import type { DigitalAsset } from '../modules/digital-delivery/ports'
+import { logCommerceIssue } from '../lib/commerce-issues'
 
 /**
  * The orchestration: order → payment check → assets → grants → Medusa
@@ -129,6 +130,16 @@ const resolveDigitalItemsStep = createStep(
      * guard that a second caller forgets.
      */
     if (!payment.ok) {
+      await logCommerceIssue(logger, {
+        stage: 'fulfilment',
+        code: 'fulfilment.digital_blocked_unpaid',
+        severity: 'critical',
+        message: `Digital delivery refused: ${payment.reason}. Buyer has no download links.`,
+        orderId: input.orderId,
+        email: (order as any)?.email ?? null,
+        customerId: (order as any)?.customer_id ?? null,
+        context: { payment_status: payment.status },
+      })
       logger.error(
         `[digital] REFUSING to deliver order ${input.orderId}: ${payment.reason}. ` +
           `No grants, no email, no fulfillment. Set metadata ${COMP_METADATA_FLAG}=true ` +

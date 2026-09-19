@@ -98,7 +98,10 @@ const DIGITAL_OPTION_DATA_ID = "digital-delivery"
  * below must carry a PHP price. If a physical product is ever in a cart with no
  * priced option available, `ensureShippingMethod` throws a 409 the buyer sees.
  */
-const SEED_PHYSICAL_SHIPPING = false
+// Enabled per run, not by editing this file:
+//   SEED_PHYSICAL_SHIPPING=true npx medusa exec ./src/scripts/seed.ts
+// Idempotent — on an already-seeded lane it only adds what is missing.
+const SEED_PHYSICAL_SHIPPING = process.env.SEED_PHYSICAL_SHIPPING === "true"
 const PHYSICAL_PROVIDER_ID = "manual_manual"
 const PHYSICAL_OPTIONS = [
   { name: "Standard Delivery", code: "standard", amount: 200 },
