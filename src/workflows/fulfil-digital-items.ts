@@ -14,7 +14,8 @@ import { DIGITAL_DELIVERY_GRANTED } from '../modules/digital-delivery/ports'
 import type { DigitalAsset } from '../modules/digital-delivery/ports'
 
 /**
- * The orchestration: order → assets → grants → Medusa fulfillment → event.
+ * The orchestration: order → payment check → assets → grants → Medusa
+ * fulfillment → event.
  *
  * This lives in a workflow rather than in the fulfillment provider because it
  * spans four modules (Product, digital-delivery, Fulfillment, Event) and because
@@ -28,10 +29,62 @@ import type { DigitalAsset } from '../modules/digital-delivery/ports'
 
 // ---------------------------------------------------------------------------
 
+/**
+ * The payment states a digital delivery may proceed on.
+ *
+ * PayMongo Hosted Checkout takes the money at the moment of payment, so a
+ * genuinely paid order arrives here as `captured`. `authorized` is deliberately
+ * NOT on this list: an authorisation is a promise, and a file, once downloaded,
+ * cannot be un-downloaded when the promise is not kept.
+ */
+const DELIVERABLE_PAYMENT_STATUSES = ['captured', 'partially_captured']
+
+/**
+ * The escape hatch for the cases the subscriber's comment defends — a comp, a
+ * bank transfer settled off-platform, an order an admin created by hand.
+ *
+ * It is metadata an operator sets ON PURPOSE, one order at a time, and it leaves
+ * a trace in the order record explaining why an unpaid order was delivered. That
+ * is the difference between an exception and a hole.
+ */
+const COMP_METADATA_FLAG = 'allow_unpaid_digital'
+
+interface PaymentVerdict {
+  ok: boolean
+  status: string
+  reason: string
+}
+
+function assessPaymentForDelivery(order: any): PaymentVerdict {
+  const status = String(order?.payment_status ?? 'unknown')
+
+  if (DELIVERABLE_PAYMENT_STATUSES.includes(status)) {
+    return { ok: true, status, reason: '' }
+  }
+
+  const flag = (order?.metadata ?? {})[COMP_METADATA_FLAG]
+
+  if (flag === true || String(flag ?? '').toLowerCase() === 'true') {
+    return { ok: true, status, reason: `delivered unpaid by ${COMP_METADATA_FLAG}` }
+  }
+
+  return { ok: false, status, reason: `payment_status is "${status}"` }
+}
+
+// ---------------------------------------------------------------------------
+
 const resolveDigitalItemsStep = createStep(
   'resolve-digital-items',
   async (input: { orderId: string }, { container }) => {
     const query = container.resolve('query')
+    const logger = container.resolve('logger') as any
+
+    const empty = {
+      order: null,
+      assets: [] as DigitalAsset[],
+      lineItems: [] as Array<{ id: string; quantity: number }>,
+      payment: { ok: false, status: 'unknown', reason: 'no order' } as PaymentVerdict,
+    }
 
     const { data: [order] } = await query.graph({
       entity: 'order',
@@ -39,8 +92,15 @@ const resolveDigitalItemsStep = createStep(
         'id',
         'email',
         'customer_id',
+        // The gate. Without this field the workflow cannot tell a paid order
+        // from a comped one from an abandoned one, and it delivers all three.
+        'payment_status',
+        'metadata',
         'items.id',
         'items.title',
+        // Load-bearing: fulfilling `quantity: 1` of a line the buyer bought two
+        // of leaves the order permanently `partially_fulfilled`.
+        'items.quantity',
         'items.variant_id',
         'items.product_id',
         'items.product_title',
@@ -52,7 +112,36 @@ const resolveDigitalItemsStep = createStep(
       filters: { id: input.orderId },
     })
 
-    if (!order) return new StepResponse({ order: null, assets: [] as DigitalAsset[] })
+    if (!order) return new StepResponse(empty)
+
+    const payment = assessPaymentForDelivery(order)
+
+    /**
+     * THE GATE.
+     *
+     * Everything below this line hands a customer a file they can keep. Nothing
+     * below this line runs for an order that has not been paid for.
+     *
+     * It is checked here rather than in the subscriber on purpose: the
+     * subscriber's job is "an order was placed", and it is also not the only
+     * possible caller — an admin retrying delivery from the UI, or the reconcile
+     * job, must be held to the same rule. A guard that lives in one caller is a
+     * guard that a second caller forgets.
+     */
+    if (!payment.ok) {
+      logger.error(
+        `[digital] REFUSING to deliver order ${input.orderId}: ${payment.reason}. ` +
+          `No grants, no email, no fulfillment. Set metadata ${COMP_METADATA_FLAG}=true ` +
+          'on the order if this is a deliberate comp.'
+      )
+
+      return new StepResponse({ ...empty, order, payment })
+    }
+
+    if (payment.reason) {
+      // A comp went out. Not an error, but never silent.
+      logger.warn(`[digital] order ${input.orderId}: ${payment.reason} (${payment.status})`)
+    }
 
     const catalogue = new MetadataAssetCatalogue(
       container.resolve(Modules.PRODUCT),
@@ -61,7 +150,82 @@ const resolveDigitalItemsStep = createStep(
 
     const assets = await catalogue.resolve(order.items ?? [])
 
-    return new StepResponse({ order, assets })
+    /**
+     * Quantities, carried alongside the assets rather than inside them.
+     *
+     * A DigitalAsset describes a FILE; how many of it the buyer bought is a
+     * property of the order line, not of the file. Merging the two would mean a
+     * grant needing to know about quantity, which it does not — one grant covers
+     * the line however many were bought.
+     */
+    const quantityOf = new Map<string, number>(
+      ((order.items ?? []) as any[]).map((item) => [
+        String(item?.id ?? ''),
+        Math.max(1, Number(item?.quantity ?? 1) || 1),
+      ])
+    )
+
+    const lineItems = [...new Set(assets.map((asset) => asset.lineItemId))].map((id) => ({
+      id,
+      quantity: quantityOf.get(id) ?? 1,
+    }))
+
+    return new StepResponse({ order, assets, lineItems, payment })
+  }
+)
+
+/**
+ * Records WHY an order was refused, on the order itself.
+ *
+ * Medusa has no "partially unfulfilled" status to set — `fulfillment_status` is
+ * derived from the fulfillments that exist, and a refused order correctly has
+ * none, so it reads as `not_fulfilled`. That is the honest state; what it does
+ * not do is say why, and "unfulfilled" looks identical whether delivery was
+ * blocked, errored, or never attempted.
+ *
+ * So the reason goes in metadata, where it is visible in admin next to the order
+ * and queryable in SQL. An operator who fixes the payment can clear the flag and
+ * re-run delivery; nothing here is a dead end.
+ */
+const recordDeliveryBlockStep = createStep(
+  'record-digital-delivery-block',
+  async (
+    input: { orderId: string; blocked: boolean; status: string; reason: string },
+    { container }
+  ) => {
+    if (!input.blocked) return new StepResponse(void 0)
+
+    const logger = container.resolve('logger') as any
+
+    try {
+      const query = container.resolve('query')
+
+      const { data: [order] } = await query.graph({
+        entity: 'order',
+        fields: ['id', 'metadata'],
+        filters: { id: input.orderId },
+      })
+
+      await (container.resolve(Modules.ORDER) as any).updateOrders([
+        {
+          id: input.orderId,
+          metadata: {
+            ...((order as any)?.metadata ?? {}),
+            digital_delivery_status: 'blocked_unpaid',
+            digital_delivery_blocked_reason: input.reason,
+            digital_delivery_payment_status: input.status,
+            digital_delivery_blocked_at: new Date().toISOString(),
+          },
+        },
+      ])
+    } catch (error) {
+      logger.warn(
+        `[digital] could not record the delivery block on ${input.orderId}: ` +
+          `${(error as Error)?.message ?? error}`
+      )
+    }
+
+    return new StepResponse(void 0)
   }
 )
 
@@ -153,10 +317,14 @@ const emitGrantedStep = createStep(
 const recordFulfillmentStep = createStep(
   'record-digital-fulfillment',
   async (
-    input: { orderId: string; lineItemIds: string[]; hasShipping: boolean },
+    input: {
+      orderId: string
+      lineItems: Array<{ id: string; quantity: number }>
+      hasShipping: boolean
+    },
     { container }
   ) => {
-    if (!input.lineItemIds.length) return new StepResponse(void 0)
+    if (!input.lineItems.length) return new StepResponse(void 0)
 
     const logger = container.resolve('logger')
     const query = container.resolve('query')
@@ -200,7 +368,17 @@ const recordFulfillmentStep = createStep(
       await createOrderFulfillmentWorkflow(container).run({
         input: {
           order_id: input.orderId,
-          items: input.lineItemIds.map((id) => ({ id, quantity: 1 })),
+          /**
+           * The REAL quantity, not 1.
+           *
+           * This was `quantity: 1` for every line, which is correct exactly when
+           * the buyer bought one of everything. Buy two copies of an ebook and
+           * Medusa records 1 of 2 fulfilled and computes `partially_fulfilled`
+           * forever — on an order where both copies were delivered, because a
+           * grant covers the line regardless of quantity. Months of "why is this
+           * order stuck at partially fulfilled" trace back to this one literal.
+           */
+          items: input.lineItems.map((line) => ({ id: line.id, quantity: line.quantity })),
           ...(locationId ? { location_id: locationId } : {}),
           // The buyer is told by the digital_delivery.granted email, which
           // carries the actual links. Medusa's generic shipment notice would be
@@ -228,6 +406,25 @@ export const fulfilDigitalItemsWorkflow = createWorkflow(
   (input: { orderId: string }) => {
     const resolved = resolveDigitalItemsStep(input)
 
+    /**
+     * Runs first and unconditionally. A refused order must be explained even
+     * though — especially though — nothing else in this workflow will do
+     * anything for it.
+     */
+    recordDeliveryBlockStep(
+      transform({ input, resolved }, (data) => ({
+        orderId: data.input.orderId,
+        blocked: Boolean((data.resolved as any)?.order) && !(data.resolved as any)?.payment?.ok,
+        status: String((data.resolved as any)?.payment?.status ?? 'unknown'),
+        reason: String((data.resolved as any)?.payment?.reason ?? ''),
+      }))
+    )
+
+    /**
+     * With the gate closed, `assets` is empty — so the three steps below are all
+     * no-ops by their own guards. The refusal is enforced by there being nothing
+     * to act on, not by a branch that a later edit could forget to add.
+     */
     const granted = createDigitalGrantsStep({
       order: resolved.order,
       assets: resolved.assets,
@@ -242,8 +439,11 @@ export const fulfilDigitalItemsWorkflow = createWorkflow(
     recordFulfillmentStep(
       transform({ input, resolved }, (data) => ({
         orderId: data.input.orderId,
-        lineItemIds: (data.resolved.assets ?? []).map((asset: DigitalAsset) => asset.lineItemId),
-        hasShipping: Boolean((data.resolved.order as any)?.shipping_methods?.length),
+        lineItems: ((data.resolved as any)?.lineItems ?? []) as Array<{
+          id: string
+          quantity: number
+        }>,
+        hasShipping: Boolean((data.resolved as any)?.order?.shipping_methods?.length),
       }))
     )
 

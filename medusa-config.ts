@@ -111,6 +111,39 @@ module.exports = defineConfig({
     { key: "api_key", resolve: "@medusajs/medusa/api-key" },
 
     // -----------------------------------------------------------------------
+    // Redis event bus + workflow engine — REQUIRED by the PayMongo webhook
+    // (ADR 0003). Without them the event bus is in-memory: a queued webhook is
+    // lost on redeploy and a worker-mode process never sees it.
+    // `family: 0` because Railway's private network is IPv6-only.
+    // -----------------------------------------------------------------------
+    {
+      resolve: "@medusajs/medusa/event-bus-redis",
+      options: {
+        redisUrl: process.env.REDIS_URL,
+        redisOptions: { family: 0 },
+        jobOptions: {
+          removeOnComplete: { age: 3600, count: 1000 },
+          removeOnFail: { age: 86400, count: 5000 },
+        },
+      },
+    },
+    {
+      resolve: "@medusajs/medusa/workflow-engine-redis",
+      options: {
+        redis: {
+          url: process.env.REDIS_URL,
+          redisUrl: process.env.REDIS_URL,
+          options: { family: 0 },
+        },
+      },
+    },
+
+    // -----------------------------------------------------------------------
+    // PayMongo webhook idempotency ledger — table `paymongo_events` (ADR 0003).
+    // -----------------------------------------------------------------------
+    { resolve: "./src/modules/paymongo-ledger" },
+
+    // -----------------------------------------------------------------------
     // Payments — PayMongo Hosted Checkout. See docs/adr/0002.
     // Provider id is `pp_paymongo_paymongo`: pp_{identifier}_{id}.
     // -----------------------------------------------------------------------

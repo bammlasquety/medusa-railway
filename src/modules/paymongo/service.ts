@@ -23,9 +23,10 @@ import type {
   UpdatePaymentOutput,
   WebhookActionResult,
 } from '@medusajs/framework/types'
-import { AbstractPaymentProvider, BigNumber, MedusaError } from '@medusajs/framework/utils'
+import { AbstractPaymentProvider, MedusaError } from '@medusajs/framework/utils'
 
 import { PaymongoClient, verifyPaymongoSignature } from './client'
+import { PAID_EVENT_TYPE, parsePaymongoEvent } from './event-payload'
 
 /**
  * PayMongo Hosted Checkout as a Medusa payment provider.
@@ -227,12 +228,45 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
       )
     }
 
+    /**
+     * The CART id, carried into PayMongo's metadata and handed back to us on the
+     * webhook.
+     *
+     * Without it the webhook can identify a payment but not the basket it paid
+     * for, and completing an order means walking payment session → payment
+     * collection → cart through two link tables to answer a question the
+     * storefront already knew at checkout. Passing it forward costs one string
+     * and turns webhook-driven completion into a single call.
+     *
+     * The storefront supplies it in `initiatePaymentSession`'s `data`. A session
+     * created before that change simply has no `cart_id`, which the settle
+     * workflow classifies as unrecoverable — correctly, because every one of
+     * them was completed by the return path long ago.
+     */
+    const cartId = String(
+      (input.data as any)?.cart_id ?? (input.context as any)?.cart_id ?? ''
+    )
+
+    if (!cartId) {
+      this.logger_.warn(
+        '[paymongo] initiatePayment received no cart_id; this payment can only be completed ' +
+          'by the buyer returning to the storefront'
+      )
+    }
+
     const reference = `DND-${randomUUID().slice(0, 8).toUpperCase()}`
     const origin = this.resolveReturnOrigin((input.data as any)?.return_origin)
     const context: any = input.context ?? {}
 
     try {
-      return await this.createSession_(amountCentavos, reference, origin, context, sessionId)
+      return await this.createSession_(
+        amountCentavos,
+        reference,
+        origin,
+        context,
+        sessionId,
+        cartId
+      )
     } catch (error) {
       /**
        * Any raw throw out of a provider method becomes Medusa's "An unknown
@@ -254,7 +288,8 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
     reference: string,
     origin: string,
     context: any,
-    sessionId: string
+    sessionId: string,
+    cartId: string
   ): Promise<InitiatePaymentOutput> {
     const options = this.options_
 
@@ -271,6 +306,8 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
       send_email_receipt: true,
       metadata: {
         session_id: sessionId,
+        // Read back by both webhook routes via `parsePaymongoEvent`.
+        cart_id: cartId,
         reference,
         ...(context?.customer?.email ? { email: String(context.customer.email) } : {}),
       },
@@ -285,6 +322,7 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
         checkout_url: session.attributes.checkout_url,
         reference,
         session_id: sessionId,
+        cart_id: cartId,
         livemode: session.attributes.livemode,
       },
     }
@@ -425,12 +463,29 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
   }
 
   /**
-   * Maps PayMongo's webhook onto Medusa's payment vocabulary.
+   * Medusa's BUILT-IN webhook route, deliberately reduced to a verified no-op.
    *
-   * Medusa's built-in `POST /hooks/payment/paymongo` route calls this and then
-   * applies the result to the payment session — so this method is a pure mapper
-   * with one security responsibility: verify the signature before believing
-   * anything in the body.
+   * `/hooks/payment/paymongo_paymongo` and our own `/hooks/paymongo` may both be
+   * registered in the PayMongo dashboard, so that no delivery is lost while the
+   * endpoint is switched over. Only one of them may ACT, and it cannot be this
+   * one — for a specific mechanical reason worth writing down.
+   *
+   * Returning `captured` here makes Medusa authorise and capture the payment
+   * session. `completeCartWorkflow` then finds no session in `pending` state,
+   * `validateCartPaymentsStep` throws, and the cart can never become an order —
+   * not by the buyer returning, not by the settle workflow, not by hand. The
+   * money is captured and the order does not exist. That failure appears the
+   * first time PayMongo successfully delivers to this endpoint, which is exactly
+   * the change this work set out to make happen.
+   *
+   * So the signature is still verified (an unsigned body must never look
+   * acceptable, whichever door it knocks on), the delivery is acknowledged, and
+   * the actual work is left to `/hooks/paymongo`, which completes the cart
+   * through the normal path and lets Medusa authorise and capture in the right
+   * order.
+   *
+   * Retiring this endpoint is a dashboard change, not a code change: delete it
+   * in PayMongo and nothing here needs touching.
    */
   async getWebhookActionAndData(
     payload: ProviderWebhookPayload['payload']
@@ -455,50 +510,29 @@ class PaymongoProviderService extends AbstractPaymentProvider<PaymongoOptions> {
         secret: this.options_.webhookSecret,
       })
     ) {
-      this.logger_.error('[paymongo] webhook signature rejected')
+      this.logger_.error('[paymongo] webhook signature rejected (built-in route)')
       return nothing
     }
 
-    const body: any = payload.data ?? {}
+    const event = parsePaymongoEvent(payload.data ?? {})
 
-    /**
-     * PayMongo documents two payload shapes and they disagree about where the
-     * event type lives — `data.attributes.type` in the events reference,
-     * `data.type` in the Hosted Checkout docs. Reading only one is how a paid
-     * order silently never gets fulfilled. Accept both.
-     */
-    const envelope = body?.data ?? body
-    const attributes = envelope?.attributes ?? {}
-    const eventType =
-      attributes.type && attributes.type !== 'event' ? attributes.type : envelope?.type
-
-    if (eventType !== 'checkout_session.payment.paid') return nothing
-
-    const resource = attributes.data ?? envelope?.data ?? envelope
-    const sessionId = String(resource?.attributes?.metadata?.session_id ?? '')
-    const payment = resource?.attributes?.payments?.[0]
-    const amountCentavos = Number(payment?.attributes?.amount ?? 0)
-
-    if (!sessionId) {
-      // No Medusa session id in metadata means this payment cannot be matched.
-      // Returning not_supported (rather than failed) leaves the return-path
-      // fallback free to authorise it.
+    if (event.eventType === PAID_EVENT_TYPE) {
+      /**
+       * Loud, because this is the state where the dashboard is still pointed at
+       * the old endpoint and webhook-driven completion is therefore NOT running.
+       * Orders still get created when the buyer returns to the success page, so
+       * nothing is broken — but the guarantee this work exists to provide is not
+       * in force until the new endpoint is registered.
+       */
       this.logger_.warn(
-        '[paymongo] paid webhook carried no session_id in metadata; ' +
-          'falling back to authorisation on return'
+        `[paymongo] paid event ${event.eventId || '(no id)'} arrived on the built-in route. ` +
+          'It is acknowledged and NOT acted on. Register ' +
+          'https://<your-medusa-host>/hooks/paymongo in the PayMongo dashboard to enable ' +
+          'webhook-driven order completion.'
       )
-      return nothing
     }
 
-    return {
-      action: 'captured',
-      data: {
-        session_id: sessionId,
-        // Medusa compares this against the session amount, so it must be in the
-        // same major units Medusa initiated with — not centavos.
-        amount: new BigNumber(amountCentavos / 100),
-      },
-    }
+    return nothing
   }
 }
 
