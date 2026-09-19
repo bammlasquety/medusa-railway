@@ -40,9 +40,18 @@ export interface PaymongoSession {
     livemode: boolean
     reference_number?: string
     status?: string
-    payments?: Array<{ id: string; attributes?: { status?: string; amount?: number } }>
+    payments?: PaymongoPaymentRef[]
+    payment_intent?: {
+      id?: string
+      attributes?: { status?: string; payments?: PaymongoPaymentRef[] }
+    } | null
     metadata?: Record<string, string>
   }
+}
+
+export interface PaymongoPaymentRef {
+  id: string
+  attributes?: { status?: string; amount?: number }
 }
 
 export class PaymongoApiError extends Error {
@@ -170,6 +179,14 @@ export class PaymongoClient {
     return json.data
   }
 
+  async retrievePaymentIntent(intentId: string): Promise<{
+    id: string
+    attributes?: { status?: string; payments?: PaymongoPaymentRef[] }
+  }> {
+    const json = await this.versioned('payment_intents', `/payment_intents/${intentId}`)
+    return json.data
+  }
+
   /**
    * Checkout Sessions never expire on their own — this call is the only thing
    * that stops one accepting payment.
@@ -206,7 +223,43 @@ export class PaymongoClient {
   async findPaidPayment(
     session: PaymongoSession | null | undefined
   ): Promise<{ id: string; amount: number } | null> {
-    const payments = session?.attributes?.payments ?? []
+    /**
+     * Payments can live in two places, and QR Ph proved it.
+     *
+     * Card and e-wallet payments show up on the Checkout Session's own
+     * `payments[]`. A QR Ph payment settles asynchronously: the session's
+     * `payments[]` can stay EMPTY while the money sits on the session's
+     * Payment Intent — `checkout_session.payment.paid` for
+     * cs_ad3fb27606ab725f4c2cba9a arrived with `payments: []` and the intent
+     * `processing`. Reading only the session made every QR Ph order look
+     * unpaid forever, and the success page spun on money that had moved.
+     *
+     * So: the session's payments, then the intent's embedded payments, then —
+     * if both are empty — the intent itself, fetched fresh.
+     */
+    const intent = session?.attributes?.payment_intent
+    let payments: PaymongoPaymentRef[] = [
+      ...(session?.attributes?.payments ?? []),
+      ...(intent?.attributes?.payments ?? []),
+    ]
+
+    if (!payments.length && intent?.id) {
+      try {
+        const fresh = await this.retrievePaymentIntent(String(intent.id))
+        payments = fresh?.attributes?.payments ?? []
+        if (!payments.length) {
+          this.logger.info(
+            `[paymongo] session ${session?.id}: intent ${intent.id} is ` +
+              `${fresh?.attributes?.status ?? 'unknown'} with no payments yet`
+          )
+        }
+      } catch (error) {
+        this.logger.warn(
+          `[paymongo] could not retrieve intent ${intent.id}: ${(error as Error)?.message ?? error}`
+        )
+      }
+    }
+
     if (!payments.length) return null
 
     for (const candidate of payments) {
