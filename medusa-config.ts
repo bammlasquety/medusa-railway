@@ -143,6 +143,9 @@ module.exports = defineConfig({
     // -----------------------------------------------------------------------
     { resolve: "./src/modules/paymongo-ledger" },
 
+    // Password reset by emailed PIN — table `password_reset_code`.
+    { resolve: "./src/modules/password-reset" },
+
     // -----------------------------------------------------------------------
     // Payments — PayMongo Hosted Checkout. See docs/adr/0002.
     // Provider id is `pp_paymongo_paymongo`: pp_{identifier}_{id}.
