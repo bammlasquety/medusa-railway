@@ -56,8 +56,38 @@ interface PaymentVerdict {
   reason: string
 }
 
+/**
+ * The order's payment status, derived from its payment collections.
+ *
+ * `order.payment_status` is NOT a stored column — Medusa computes it inside its
+ * own order-detail workflows, and `query.graph` returns nothing for it. Reading
+ * it here made every order look "unknown", so the gate refused every paid
+ * ebook: no grants, no email, order left unfulfilled (orders #22/#23 on
+ * staging, 2026-09-20). The collections are real data; derive from them.
+ */
+export function derivePaymentStatus(order: any): string {
+  if (order?.payment_status) return String(order.payment_status)
+
+  const collections = (order?.payment_collections ?? []).filter(Boolean) as any[]
+  if (!collections.length) return 'unknown'
+
+  const captured = (c: any) => Number(c?.captured_amount ?? 0)
+  const amount = (c: any) => Number(c?.amount ?? 0)
+
+  if (collections.some((c) => c.status === 'completed' || (amount(c) > 0 && captured(c) >= amount(c)))) {
+    return 'captured'
+  }
+  if (collections.some((c) => captured(c) > 0 || c.status === 'partially_captured')) {
+    return 'partially_captured'
+  }
+  if (collections.some((c) => c.status === 'authorized' || c.status === 'partially_authorized')) {
+    return 'authorized'
+  }
+  return String(collections[0]?.status ?? 'not_paid')
+}
+
 function assessPaymentForDelivery(order: any): PaymentVerdict {
-  const status = String(order?.payment_status ?? 'unknown')
+  const status = derivePaymentStatus(order)
 
   if (DELIVERABLE_PAYMENT_STATUSES.includes(status)) {
     return { ok: true, status, reason: '' }
@@ -95,8 +125,12 @@ const resolveDigitalItemsStep = createStep(
         'customer_id',
         // The gate. Without this field the workflow cannot tell a paid order
         // from a comped one from an abandoned one, and it delivers all three.
-        'payment_status',
         'metadata',
+        // The payment gate's evidence. See derivePaymentStatus.
+        'payment_collections.id',
+        'payment_collections.status',
+        'payment_collections.amount',
+        'payment_collections.captured_amount',
         'items.id',
         'items.title',
         // Load-bearing: fulfilling `quantity: 1` of a line the buyer bought two
@@ -114,6 +148,26 @@ const resolveDigitalItemsStep = createStep(
     })
 
     if (!order) return new StepResponse(empty)
+
+    const catalogue = new MetadataAssetCatalogue(
+      container.resolve(Modules.PRODUCT),
+      container.resolve('logger')
+    )
+
+    const assets = await catalogue.resolve(order.items ?? [])
+
+    /**
+     * Nothing digital in the order (a seedling, a calendar): nothing to deliver
+     * and nothing to refuse. Returning before the gate keeps physical orders out
+     * of the "delivery refused" alerts.
+     */
+    if (!assets.length) {
+      return new StepResponse({
+        ...empty,
+        order,
+        payment: { ok: true, status: 'n/a', reason: '' } as PaymentVerdict,
+      })
+    }
 
     const payment = assessPaymentForDelivery(order)
 
@@ -154,12 +208,6 @@ const resolveDigitalItemsStep = createStep(
       logger.warn(`[digital] order ${input.orderId}: ${payment.reason} (${payment.status})`)
     }
 
-    const catalogue = new MetadataAssetCatalogue(
-      container.resolve(Modules.PRODUCT),
-      container.resolve('logger')
-    )
-
-    const assets = await catalogue.resolve(order.items ?? [])
 
     /**
      * Quantities, carried alongside the assets rather than inside them.
