@@ -176,6 +176,7 @@ const stampPaymongoTraceStep = createStep(
       checkoutSessionId: string
       paymongoPaymentId: string
       eventId: string
+      paymentMethod: string
       livemode: boolean
     },
     { container }
@@ -203,6 +204,7 @@ const stampPaymongoTraceStep = createStep(
             paymongo_reference: input.reference || null,
             paymongo_checkout_session_id: input.checkoutSessionId || null,
             paymongo_payment_id: input.paymongoPaymentId || null,
+            paymongo_payment_method: input.paymentMethod || null,
             paymongo_event_id: input.eventId || null,
             paymongo_livemode: input.livemode,
           },
@@ -306,6 +308,7 @@ export const settlePaymongoPaymentWorkflow = createWorkflow(
         reference: String((data.claim as any)?.event?.reference ?? ''),
         checkoutSessionId: String((data.claim as any)?.event?.checkoutSessionId ?? ''),
         paymongoPaymentId: String((data.claim as any)?.event?.paymongoPaymentId ?? ''),
+        paymentMethod: String((data.claim as any)?.event?.paymentMethod ?? ''),
         eventId: String((data.claim as any)?.event?.eventId ?? ''),
         livemode: Boolean((data.claim as any)?.event?.livemode),
       }))

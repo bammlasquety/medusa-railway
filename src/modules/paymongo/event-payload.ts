@@ -30,6 +30,14 @@ export interface ParsedPaymongoEvent {
   reference: string
   paymongoPaymentId: string
   amountCentavos: number
+  /**
+   * How the buyer paid, e.g. "card · visa •••• 4345", "gcash", "qrph".
+   *
+   * PayMongo's `payment_method_used` on the checkout session is often NULL in
+   * the paid event (it was for card payment cs_e18b8e85…), while the payment
+   * itself carries `source.type` / `brand` / `last4`. Prefer the payment.
+   */
+  paymentMethod: string
 }
 
 function text(value: unknown): string {
@@ -56,9 +64,24 @@ export function parsePaymongoEvent(body: unknown): ParsedPaymongoEvent {
   const resourceAttributes = resource?.attributes ?? {}
   const metadata = resourceAttributes?.metadata ?? {}
 
-  const payment = Array.isArray(resourceAttributes?.payments)
-    ? resourceAttributes.payments[0]
-    : undefined
+  const payments = [
+    ...(Array.isArray(resourceAttributes?.payments) ? resourceAttributes.payments : []),
+    ...(Array.isArray(resourceAttributes?.payment_intent?.attributes?.payments)
+      ? resourceAttributes.payment_intent.attributes.payments
+      : []),
+  ]
+  // The paid one if there is one (a session can carry a failed attempt first).
+  const payment =
+    payments.find((p: any) => p?.attributes?.status === 'paid') ?? payments[0] ?? undefined
+
+  const source = payment?.attributes?.source ?? {}
+  const sourceType = text(source?.type)
+  const cardDetail = [text(source?.brand), text(source?.last4) ? `•••• ${text(source.last4)}` : '']
+    .filter(Boolean)
+    .join(' ')
+  const paymentMethod =
+    (sourceType ? [sourceType, cardDetail].filter(Boolean).join(' · ') : '') ||
+    text(resourceAttributes?.payment_method_used)
 
   return {
     eventId: text(envelope?.id) || text(root?.id),
@@ -72,5 +95,6 @@ export function parsePaymongoEvent(body: unknown): ParsedPaymongoEvent {
     reference: text(resourceAttributes?.reference_number) || text(metadata?.reference),
     paymongoPaymentId: text(payment?.id),
     amountCentavos: Number(payment?.attributes?.amount ?? 0) || 0,
+    paymentMethod,
   }
 }
