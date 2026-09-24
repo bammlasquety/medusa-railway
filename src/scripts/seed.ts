@@ -250,7 +250,26 @@ export default async function seed({ container }: ExecArgs) {
   // profile represented in the cart. A digital-only cart must not be asked to
   // pay physical postage, and a mixed cart needs both.
 
+  /**
+   * Match on TYPE first, then name.
+   *
+   * Medusa creates its own "Default Shipping Profile" (type "default") when the
+   * fulfillment module is installed. An earlier version of this script looked
+   * the profile up by name only, found nothing, and created a SECOND profile of
+   * type "default" called "Default". Nothing complains at seed time — the damage
+   * shows up at checkout, because a product sits in one default profile while
+   * the shipping option the admin created sits in the other, and
+   * `completeCartWorkflow` rejects the cart with "The cart items require
+   * shipping profiles that are not satisfied by the current shipping methods"
+   * AFTER the buyer has already paid. A store may hold many profiles, but only
+   * one per type is ever wanted here.
+   */
   const ensureProfile = async (name: string, type: string) => {
+    const byType = await findOne("shipping_profile", { type }, ["id", "name", "type"])
+    if (byType) {
+      note("skipped", `shipping profile "${byType.name}" (existing ${type} profile)`)
+      return byType
+    }
     const found = await findOne("shipping_profile", { name }, ["id", "name"])
     if (found) {
       note("skipped", `shipping profile "${name}"`)
