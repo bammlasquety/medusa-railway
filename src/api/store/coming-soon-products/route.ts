@@ -32,6 +32,7 @@ const FIELDS = [
   'collection.id',
   'collection.handle',
   'collection.title',
+  'type.value',
   'sales_channels.id',
   'variants.id',
   'variants.title',
